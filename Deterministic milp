@@ -56,7 +56,7 @@ wh_max = 500
 demand = [8,8,9,8,8,8,8,9,8,8,8,8,9,8,8,8,8,9,8,8,8,8,8,8,9,8,8,8,8,9,8,8,8,8,9,8,8,8,8,9,8,8,9,9,8,9,9,9,9,8,9,9,9,9,8,9,9,9,8,9,8,9,9,9,9,10,9,10,9,10,9,10,9,10,9,10,9,10,9,9,10,9,10,9,10,9,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,10,11,10,11,10,10,11,10,11,10,10,10,11,10,10,10,11,10,11,10,11,10,9,9,10,9,9,9,10,9,10,9,9,9,10,9,9,9,9,10,9,9,9,10,9,10,10,9,10,10,10,10,9,10,10,10,10,9,10,10,10,10,9,10,10,10,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,13,12,13,12,12,13,12,13,12,12,13,12,13,12,12,13,12,13,12,13,12,10,10,9,10,10,10,10,9,10,10,10,10,9,10,10,10,10,9,10,10,10,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10]
 capacity = [21]*261
 
-# Month selection logic
+# Month selection logic (for scenario testing)
 month_days = {'Jan':22, 'Feb':20, 'Mar':23, 'Apr':22, 'May':23, 'Jun':20, 'Jul':23, 'Aug':22, 'Sep':23, 'Oct':22, 'Nov':21, 'Dec':20}
 selected_months = ['Mar']  # Change this list to select months, e.g., ['Jun', 'Jul', 'Aug']
 
@@ -73,6 +73,13 @@ T = sum(month_days[m] for m in selected_months)
 demand = demand[start_day:end_day]
 capacity = capacity[start_day:end_day]
 
+# Override planning horizon to exactly 2 weeks (14 days) as requested
+T = 14
+if len(demand) < T:
+    raise ValueError(f"Not enough demand data for {T} days")
+demand = demand[:T]
+capacity = capacity[:T]
+
 # Overtime parameters
 base_labor_rate = 20  # $/hour
 overtime_multiplier = 1.5  # 50% higher for OT hours
@@ -83,15 +90,27 @@ overtime_cost_per_hour = base_labor_rate * overtime_multiplier
 productivity_per_hour = 5  # Units per hour
 
 # Rework parameters
-rework_cost_per_unit = 2.0  # $ per reworked unit
-rework_yield_loss = 0.05  # 5% loss in rework
+# (removed from model: yield is already captured in production and raw material requirements)
+# rework_cost_per_unit = 2.0  # $ per reworked unit
+# rework_yield_loss = 0.05  # 5% loss in rework
 
 # Capacity expansion
 expansion_cost = 1000  # $ per expansion
 expansion_increment = 5  # Units added
 
-# Subcontractor
-subcontract_cost_per_unit = 15  # $ per unit subcontracted
+# Subcontractor costs
+# Subcontractor uses same material cost base but slightly higher transport/labor than in-house.
+subcontract_enabled = False  # default: OFF (set True to enable subcontracting)
+subcontract_material_cost = material_cost
+subcontract_labor_cost = labor_cost * 1.08  # e.g., 8% premium on labor
+subcontract_transport_cost = 1.50  # additional transport/premium per unit
+subcontract_cost_per_unit = (subcontract_material_cost
+                             + subcontract_labor_cost
+                             + subcontract_transport_cost)
+
+# Ordering costs
+ordering_fixed_cost = 30  # fixed cost per PO placement
+ordering_unit_cost_multiplier = 1.0  # multiplier for part unit cost in purchase cost (1x by default)
 
 # Wastage
 wastage_rate = np.random.uniform(0.01, 0.05)  # Random wastage 1-5%
@@ -159,10 +178,6 @@ zo = {(i, t): pulp.LpVariable(f"po_flag_{i}_{t}", cat="Binary")
 ot = {t: pulp.LpVariable(f"overtime_{t}", 0, cat="Integer") for t in days}
 # ot[t] = overtime hours on day t
 
-# Rework
-rw = {t: pulp.LpVariable(f"rework_{t}", 0) for t in days}
-# rw[t] = units reworked on day t
-
 # Capacity expansion
 exp = {t: pulp.LpVariable(f"expand_{t}", cat="Binary") for t in days}
 # exp[t] = 1 if capacity expanded on day t
@@ -200,15 +215,20 @@ obj = pulp.lpSum([
     + ss_penalty * ss_viol[t]     # Dipping below safety stock
     + fixed_daily                 # Fixed overhead
     + overtime_cost_per_hour * ot[t]  # Overtime cost
-    + rework_cost_per_unit * rw[t]    # Rework cost
     + expansion_cost * exp[t]          # Expansion cost
-    + subcontract_cost_per_unit * sub[t]  # Subcontract cost
+    + (subcontract_cost_per_unit * sub[t] if subcontract_enabled else 0)  # Subcontract cost
     + material_cost * wst[t]            # Wastage cost (material loss)
     for t in days
 ])
 for i in range(n_parts):
     rm_h = parts[i]["cost"] * parts[i]["hold_pct"] / 100 / 365
     obj += pulp.lpSum([rm_h * RI[i, t+1] for t in days])  # RM holding
+
+    # Purchase and ordering cost for RM
+    obj += pulp.lpSum([
+        parts[i]["cost"] * ordering_unit_cost_multiplier * r[i, t] + ordering_fixed_cost * zo[i, t]
+        for t in rng_ext
+    ])
 model += obj, "Total_Cost"
 
 # ============================================================
@@ -216,11 +236,17 @@ model += obj, "Total_Cost"
 # ============================================================
 # Rules the model must follow, ensuring feasibility.
 for t in days:
-    # C1: FG FLOW BALANCE (with rework, wastage, sub)
-    if backorder_on and t > 0:
-        model += Inv[t+1] == Inv[t] + p[t]*yield_pct - demand[t] - s[t-1] - e[t] + s[t] + rw[t]*(1 - rework_yield_loss) - wst[t] + sub[t], f"flow_{t}"
+    # C1: FG FLOW BALANCE (with wastage, subcontracting)
+    if subcontract_enabled:
+        if backorder_on and t > 0:
+            model += Inv[t+1] == Inv[t] + p[t]*yield_pct - demand[t] - s[t-1] - e[t] + s[t] - wst[t] + sub[t], f"flow_{t}"
+        else:
+            model += Inv[t+1] == Inv[t] + p[t]*yield_pct - demand[t] - e[t] + s[t] - wst[t] + sub[t], f"flow_{t}"
     else:
-        model += Inv[t+1] == Inv[t] + p[t]*yield_pct - demand[t] - e[t] + s[t] + rw[t]*(1 - rework_yield_loss) - wst[t] + sub[t], f"flow_{t}"
+        if backorder_on and t > 0:
+            model += Inv[t+1] == Inv[t] + p[t]*yield_pct - demand[t] - s[t-1] - e[t] + s[t] - wst[t], f"flow_{t}"
+        else:
+            model += Inv[t+1] == Inv[t] + p[t]*yield_pct - demand[t] - e[t] + s[t] - wst[t], f"flow_{t}"
 
     # C2: CAPACITY (with overtime and expansion)
     model += p[t] <= capacity[t] * y[t] + expansion_increment * exp[t] + ot[t] * productivity_per_hour, f"cap_{t}"
@@ -241,16 +267,15 @@ for t in days:
     # New: Overtime limit
     model += ot[t] <= 4, f"ot_limit_{t}"  # Max 4 hours OT
 
-    # New: Rework
-    model += rw[t] <= 5, f"rw_limit_{t}"  # Max 5 units rework per day
-    model += rw[t] <= Inv[t], f"rw_inv_{t}"  # Can't rework more than inventory
-
     # New: Wastage
     model += wst[t] >= wastage_rate * p[t], f"wst_min_{t}"
     model += wst[t] <= (wastage_rate + 0.05) * p[t], f"wst_max_{t}"
 
-    # New: Subcontract limit
-    model += sub[t] <= 10, f"sub_limit_{t}"  # Max 10 units subcontract per day
+    # New: Subcontract limit (disabled by default)
+    if subcontract_enabled:
+        model += sub[t] <= 10, f"sub_limit_{t}"  # Max 10 units subcontract per day
+    else:
+        model += sub[t] == 0, f"sub_off_{t}"
 
     # C7: SHELF LIFE EXPIRY
     if t >= shelf:
@@ -265,6 +290,8 @@ for t in days:
         lt = parts[i]["lt"]
         od = t - lt
         # C8: BOM EXPLOSION
+        # r[i,od] is integer, so any fractional raw material need due yield gets rounded up automatically.
+        # E.g., if required is 23.75 then r must be at least 24 units.
         if -max_lt <= od < T:
             model += r[i, od] * parts[i]["partYield"] >= p[t] * parts[i]["qty"], f"bom_{i}_{t}"
             # C9: RM FLOW BALANCE (with wastage)
@@ -290,7 +317,7 @@ print(f"Total Cost: ${pulp.value(model.objective):,.0f}\n")
 
 print(f"{'Day':>4} {'Dem':>5} {'Prod':>5} {'Inv':>5} {'Exp':>5} {'Short':>5} {'SW':>3} {'OT':>3} {'RW':>3} {'SUB':>3} {'WST':>3}")
 print("-" * 58)
-tp = te = ts = nsw = tot = trw = tsub = twst = 0
+tp = te = ts = nsw = tot = tsub = twst = 0
 for t in days:
     pv = int(p[t].varValue or 0)
     iv = Inv[t+1].varValue or 0
@@ -298,18 +325,31 @@ for t in days:
     sv = s[t].varValue or 0
     swv = 1 if (sw[t].varValue or 0) > 0.5 else 0
     otv = int(ot[t].varValue or 0)
-    rwv = rw[t].varValue or 0
     subv = int(sub[t].varValue or 0)
     wstv = wst[t].varValue or 0
-    tp += pv; te += ev; ts += sv; nsw += swv; tot += otv; trw += rwv; tsub += subv; twst += wstv
+    tp += pv; te += ev; ts += sv; nsw += swv; tot += otv; tsub += subv; twst += wstv
     flag = ""
     if ev > 0.5: flag = " EXP"
     if sv > 0.5: flag = " SHORT"
-    if t < 60 or pv > 0 or ev > 0.5 or sv > 0.5 or otv > 0 or rwv > 0.5 or subv > 0 or wstv > 0.5:
-        print(f"{t+1:>4} {demand[t]:>5} {pv:>5} {iv:>5.0f} {ev:>5.0f} {sv:>5.0f} {'Y' if swv else '':>3} {otv:>3} {rwv:>3.0f} {subv:>3} {wstv:>3.0f}{flag}")
+    if t < 60 or pv > 0 or ev > 0.5 or sv > 0.5 or otv > 0 or subv > 0 or wstv > 0.5:
+        print(f"{t+1:>4} {demand[t]:>5} {pv:>5} {iv:>5.0f} {ev:>5.0f} {sv:>5.0f} {'Y' if swv else '':>3} {otv:>3}    {subv:>3} {wstv:>3.0f}{flag}")
 
 fill = (sum(demand) - ts) / sum(demand) * 100
-print(f"\nProduced:{tp} Expired:{te:.0f} Short:{ts:.0f} Switches:{nsw} OT Hours:{tot} Rework:{trw:.0f} Sub:{tsub} Wastage:{twst:.0f} Fill:{fill:.1f}%")
+print(f"\nProduced:{tp} Expired:{te:.0f} Short:{ts:.0f} Switches:{nsw} OT Hours:{tot} Sub:{tsub} Wastage:{twst:.0f} Fill:{fill:.1f}%")
+
+# RM order summary with cost
+rm_purchase_cost = 0
+rm_ordering_cost = 0
+for i in range(n_parts):
+    for t in rng_ext:
+        rv = r[i, t].varValue or 0
+        rm_purchase_cost += parts[i]["cost"] * ordering_unit_cost_multiplier * rv
+        if (zo[i, t].varValue or 0) > 0.5:
+            rm_ordering_cost += ordering_fixed_cost
+
+print(f"  RM purchase cost: ${rm_purchase_cost:,.2f}")
+print(f"  RM ordering (PO) cost: ${rm_ordering_cost:,.2f}")
+print(f"  RM combined purchase+order: ${rm_purchase_cost + rm_ordering_cost:,.2f}\n")
 
 print(f"\nRM ORDERS:")
 for i in range(n_parts):
