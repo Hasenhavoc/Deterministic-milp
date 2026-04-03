@@ -129,7 +129,7 @@ def generate_yield(base_yield):
 current_time = 0
 total_cost = 0
 production_plan = []
-inventory_history = {k: [0] for k in range(n_products)}  # Per product inventory
+inventory_history = [on_hand_fg]
 
 while current_time < T_total:
     # Plan for next horizon
@@ -188,7 +188,7 @@ while current_time < T_total:
     
     # Initial conditions
     for k in range(n_products):
-        model += Inv[k, 0] == inventory_history[k][-1]
+        model += Inv[k, 0] == (inventory_history[-1] if k == 0 else 0)  # Assume starting inv for first product
     for i in range(n_parts):
         model += RI[i, 0] == 0  # Assume RM starts at 0 for simplicity
     
@@ -281,9 +281,9 @@ while current_time < T_total:
     # ============================================================
     # Use first day's plan, update state, repeat.
     prod_today = sum(int(p[k, 0].varValue or 0) for k in range(n_products))
-    for k in range(n_products):
-        inventory_history[k].append(Inv[k, 1].varValue or 0)
+    inv_today = sum(Inv[k, 1].varValue or 0 for k in range(n_products))
     production_plan.append(prod_today)
+    inventory_history.append(inv_today)
     total_cost += pulp.value(model.objective) / T_plan  # Approximate
     
     # Roll forward
