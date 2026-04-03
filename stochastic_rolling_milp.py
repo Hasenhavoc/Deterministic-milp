@@ -185,7 +185,8 @@ while current_time < T_total:
             if -max_lt <= od < T_plan:
                 model += r[i, od] * avg_part_yields[i] >= p[t] * parts[i]["qty"]
             if t > 0:
-                model += RI[i, t] == RI[i, t-1] + r[i, t] - p[t] * parts[i]["qty"]
+                incoming = r[i, od] if -max_lt <= od < T_plan else 0
+                model += RI[i, t] == RI[i, t-1] + incoming - p[t] * parts[i]["qty"]
             model += RI[i, t] <= parts[i]["rm_cap"]
     
     for i in range(n_parts):

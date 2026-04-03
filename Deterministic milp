@@ -296,7 +296,7 @@ for t in days:
             model += r[i, od] * parts[i]["partYield"] >= p[t] * parts[i]["qty"], f"bom_{i}_{t}"
             # C9: RM FLOW BALANCE (with wastage)
             if t > 0:
-                model += RI[i, t] == RI[i, t-1] + r[i, t] - p[t] * parts[i]["qty"] - wst[t] * parts[i]["qty"] / yield_pct, f"rm_{i}_{t}"
+                model += RI[i, t] == RI[i, t-1] + r[i, od] - p[t] * parts[i]["qty"] - wst[t] * parts[i]["qty"] / yield_pct, f"rm_{i}_{t}"
                 # C10: RM WAREHOUSE
                 model += RI[i, t] <= parts[i]["rm_cap"], f"rmcap_{i}_{t}"
 
