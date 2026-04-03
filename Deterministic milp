@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""
+Enterprise Inventory Simulator — Enhanced Deterministic MILP Production Planner
+=========================================================
+Enhanced version with overtime, rework, capacity expansion, subcontractors, wastage, and random parameters for variability.
+Paste into Google Colab (!pip install pulp numpy) or run locally.
+Set USE_GUROBI = True if you have Gurobi.
+
+Every # comment explains the formula. Comments don't affect execution.
+"""
+import pulp
+import math
+import numpy as np
+
+USE_GUROBI = False
+
+# Random seed for reproducibility
+np.random.seed(42)
+
+# ============================================================
+# 1. DATA — Auto-exported from simulator. Update via Export button.
+# ============================================================
+# This section defines all input parameters, including random values for variability.
+# Random yields and costs simulate real-world uncertainty without full stochastic modeling.
+
+# Month selection logic (see below for selected_months)
+
+shelf = 3
+# FG expires after 3 days. Forces frequent small batches.
+
+yield_pct = np.random.uniform(0.90, 0.98)  # Random yield between 90-98%
+# 100 raw → sellable. Affects cost AND RM consumption.
+
+switch_cost = 50
+# $ per BATCH START (not per day). Fires when production resumes after idle.
+
+fg_hold_per_day = 0.0216
+# Holding cost per unit per day
+
+material_cost = 27.9  # Fixed
+labor_cost = np.random.uniform(4.5, 5.5)  # Random labor cost
+unit_prod_cost = (material_cost + labor_cost) / yield_pct
+
+waste_cost = 5.58   # expired unit cost
+fixed_daily = 100    # rent/insurance/staff
+sell_price = 100
+
+backorder_on = False
+bo_penalty = 30 if backorder_on else sell_price
+
+on_hand_fg = 0
+fg_ss = 6
+ss_penalty = 0.065
+wh_max = 500
+
+demand = [8,8,9,8,8,8,8,9,8,8,8,8,9,8,8,8,8,9,8,8,8,8,8,8,9,8,8,8,8,9,8,8,8,8,9,8,8,8,8,9,8,8,9,9,8,9,9,9,9,8,9,9,9,9,8,9,9,9,8,9,8,9,9,9,9,10,9,10,9,10,9,10,9,10,9,10,9,10,9,9,10,9,10,9,10,9,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,10,11,10,11,10,10,11,10,11,10,10,10,11,10,10,10,11,10,11,10,11,10,9,9,10,9,9,9,10,9,10,9,9,9,10,9,9,9,9,10,9,9,9,10,9,10,10,9,10,10,10,10,9,10,10,10,10,9,10,10,10,10,9,10,10,10,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,13,12,13,12,12,13,12,13,12,12,13,12,13,12,12,13,12,13,12,13,12,10,10,9,10,10,10,10,9,10,10,10,10,9,10,10,10,10,9,10,10,10,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10]
+capacity = [21]*261
+
+# Month selection logic
+month_days = {'Jan':22, 'Feb':20, 'Mar':23, 'Apr':22, 'May':23, 'Jun':20, 'Jul':23, 'Aug':22, 'Sep':23, 'Oct':22, 'Nov':21, 'Dec':20}
+selected_months = ['Mar']  # Change this list to select months, e.g., ['Jun', 'Jul', 'Aug']
+
+cum_days = 0
+start_day = 0
+for m in month_days:
+    if m in selected_months:
+        start_day = cum_days
+        break
+    cum_days += month_days[m]
+end_day = start_day + sum(month_days[m] for m in selected_months)
+T = sum(month_days[m] for m in selected_months)
+
+demand = demand[start_day:end_day]
+capacity = capacity[start_day:end_day]
+
+# Overtime parameters
+base_labor_rate = 20  # $/hour
+overtime_multiplier = 1.5  # 50% higher for OT hours
+shift_hours = 8
+break_minutes = 50  # Total breaks
+effective_hours = shift_hours - break_minutes / 60
+overtime_cost_per_hour = base_labor_rate * overtime_multiplier
+productivity_per_hour = 5  # Units per hour
+
+# Rework parameters
+rework_cost_per_unit = 2.0  # $ per reworked unit
+rework_yield_loss = 0.05  # 5% loss in rework
+
+# Capacity expansion
+expansion_cost = 1000  # $ per expansion
+expansion_increment = 5  # Units added
+
+# Subcontractor
+subcontract_cost_per_unit = 15  # $ per unit subcontracted
+
+# Wastage
+wastage_rate = np.random.uniform(0.01, 0.05)  # Random wastage 1-5%
+
+parts = [
+        {"name": "Cream Bun", "qty": 1, "cost": 5.0, "trans": 0.50,
+             "lt": 3, "hold_pct": 24, "partYield": np.random.uniform(0.95, 0.99),
+                  "moq": 20, "max_order": 200, "rm_cap": 1000},
+                      {"name": "Vanilla", "qty": 2, "cost": 10.0, "trans": 1.20,
+                           "lt": 5, "hold_pct": 24, "partYield": np.random.uniform(0.90, 0.95),
+                                "moq": 50, "max_order": 500, "rm_cap": 2000},
+]
+
+# Overtime parameters: Allows extra production at higher cost.
+# Rework: Fixes defects, recovers some value.
+# Capacity expansion: Increases production capacity permanently.
+# Subcontractor: Outsourced production.
+# Wastage: Unavoidable losses in production.
+
+# ============================================================
+# 2. DECISION VARIABLES
+# ============================================================
+# Defines all variables the model can control to minimize cost.
+model = pulp.LpProblem("MPS", pulp.LpMinimize)
+days = list(range(T))
+n_parts = len(parts)
+max_lt = max(pp["lt"] for pp in parts)
+
+p = {t: pulp.LpVariable(f"produce_{t}", 0, cat="Integer") for t in days}
+# p[t] = FG units to produce on day t (integer — can't make half a cake)
+
+y = {t: pulp.LpVariable(f"active_{t}", cat="Binary") for t in days}
+# y[t] = 1 if line runs on day t. Links to capacity: p[t] ≤ C[t]×y[t]
+
+sw = {t: pulp.LpVariable(f"switch_{t}", cat="Binary") for t in days}
+# sw[t] = 1 if STARTING a batch (idle yesterday, active today)
+# sw[t] ≥ y[t] - y[t-1]: fires only on transition from 0→1
+
+Inv = {t: pulp.LpVariable(f"fg_inv_{t}", 0) for t in range(T + 1)}
+# Inv[t] = FG on hand at END of day t. Inv[0] = starting inventory.
+
+e = {t: pulp.LpVariable(f"expired_{t}", 0) for t in days}
+# e[t] = units expiring on day t (age > shelf). Forced by constraint.
+
+s = {t: pulp.LpVariable(f"shortage_{t}", 0) for t in days}
+# s[t] = unmet demand. Backorder ON: carries to t+1. OFF: forced to 0.
+
+ss_viol = {t: pulp.LpVariable(f"ss_viol_{t}", 0) for t in days}
+# ss_viol[t] = how far below SS. Penalized but not forbidden.
+
+rng_ext = range(-max_lt, T)
+r = {(i, t): pulp.LpVariable(f"order_{i}_{t}", 0, cat="Integer")
+     for i in range(n_parts) for t in rng_ext}
+# r[i,t] = RM units of subpart i ordered on day t. Arrives t + LT[i].
+
+RI = {(i, t): pulp.LpVariable(f"rm_inv_{i}_{t}", 0)
+     for i in range(n_parts) for t in range(T + 1)}
+# RI[i,t] = RM inventory of subpart i at end of day t.
+
+zo = {(i, t): pulp.LpVariable(f"po_flag_{i}_{t}", cat="Binary")
+     for i in range(n_parts) for t in rng_ext}
+# zo[i,t] = 1 if PO placed for subpart i on day t. Links to MOQ.
+
+# New variables: Overtime
+ot = {t: pulp.LpVariable(f"overtime_{t}", 0, cat="Integer") for t in days}
+# ot[t] = overtime hours on day t
+
+# Rework
+rw = {t: pulp.LpVariable(f"rework_{t}", 0) for t in days}
+# rw[t] = units reworked on day t
+
+# Capacity expansion
+exp = {t: pulp.LpVariable(f"expand_{t}", cat="Binary") for t in days}
+# exp[t] = 1 if capacity expanded on day t
+
+# Subcontractors
+sub = {t: pulp.LpVariable(f"subcontract_{t}", 0, cat="Integer") for t in days}
+# sub[t] = units subcontracted on day t
+
+# Wastage
+wst = {t: pulp.LpVariable(f"wastage_{t}", 0) for t in days}
+# wst[t] = wasted units on day t
+
+# ============================================================
+# 3. INITIAL CONDITIONS
+# ============================================================
+# Sets starting inventory levels for FG and RM.
+
+# ============================================================
+# 3. INITIAL CONDITIONS
+# ============================================================
+model += Inv[0] == on_hand_fg, "init_fg"
+for i in range(n_parts):
+    model += RI[i, 0] == 0, f"init_rm_{i}"
+
+# ============================================================
+# 4. OBJECTIVE — Minimize total cost
+# ============================================================
+# The goal: Sum of all costs over the planning horizon.
+obj = pulp.lpSum([
+    switch_cost * sw[t]           # Setup on batch start only
+    + fg_hold_per_day * Inv[t+1]  # FG holding
+    + unit_prod_cost * p[t]       # Production (yield-adjusted)
+    + waste_cost * e[t]           # Expired units
+    + bo_penalty * s[t]           # Shortage (backorder or lost sale)
+    + ss_penalty * ss_viol[t]     # Dipping below safety stock
+    + fixed_daily                 # Fixed overhead
+    + overtime_cost_per_hour * ot[t]  # Overtime cost
+    + rework_cost_per_unit * rw[t]    # Rework cost
+    + expansion_cost * exp[t]          # Expansion cost
+    + subcontract_cost_per_unit * sub[t]  # Subcontract cost
+    + material_cost * wst[t]            # Wastage cost (material loss)
+    for t in days
+])
+for i in range(n_parts):
+    rm_h = parts[i]["cost"] * parts[i]["hold_pct"] / 100 / 365
+    obj += pulp.lpSum([rm_h * RI[i, t+1] for t in days])  # RM holding
+model += obj, "Total_Cost"
+
+# ============================================================
+# 5. CONSTRAINTS
+# ============================================================
+# Rules the model must follow, ensuring feasibility.
+for t in days:
+    # C1: FG FLOW BALANCE (with rework, wastage, sub)
+    if backorder_on and t > 0:
+        model += Inv[t+1] == Inv[t] + p[t]*yield_pct - demand[t] - s[t-1] - e[t] + s[t] + rw[t]*(1 - rework_yield_loss) - wst[t] + sub[t], f"flow_{t}"
+    else:
+        model += Inv[t+1] == Inv[t] + p[t]*yield_pct - demand[t] - e[t] + s[t] + rw[t]*(1 - rework_yield_loss) - wst[t] + sub[t], f"flow_{t}"
+
+    # C2: CAPACITY (with overtime and expansion)
+    model += p[t] <= capacity[t] * y[t] + expansion_increment * exp[t] + ot[t] * productivity_per_hour, f"cap_{t}"
+
+    # C3: BATCH SWITCH (setup fires on START only)
+    model += sw[t] >= y[t] - (y[t-1] if t > 0 else 0), f"sw_{t}"
+
+    # C4: WAREHOUSE MAX
+    model += Inv[t+1] <= wh_max, f"wh_{t}"
+
+    # C5: SAFETY STOCK (soft)
+    model += ss_viol[t] >= fg_ss - Inv[t+1], f"ss_{t}"
+
+    # C6: NO BACKORDER (if disabled)
+    if not backorder_on:
+        model += s[t] == 0, f"nobo_{t}"
+
+    # New: Overtime limit
+    model += ot[t] <= 4, f"ot_limit_{t}"  # Max 4 hours OT
+
+    # New: Rework
+    model += rw[t] <= 5, f"rw_limit_{t}"  # Max 5 units rework per day
+    model += rw[t] <= Inv[t], f"rw_inv_{t}"  # Can't rework more than inventory
+
+    # New: Wastage
+    model += wst[t] >= wastage_rate * p[t], f"wst_min_{t}"
+    model += wst[t] <= (wastage_rate + 0.05) * p[t], f"wst_max_{t}"
+
+    # New: Subcontract limit
+    model += sub[t] <= 10, f"sub_limit_{t}"  # Max 10 units subcontract per day
+
+    # C7: SHELF LIFE EXPIRY
+    if t >= shelf:
+        model += (
+            pulp.lpSum([e[tau] for tau in range(max(0, t-shelf+1), t+1)])
+            >= pulp.lpSum([p[tau]*yield_pct for tau in range(max(0, t-2*shelf+1), t-shelf+1)])
+            - pulp.lpSum([demand[tau] for tau in range(max(0, t-2*shelf+1), t-shelf+1)])
+        ), f"shelf_{t}"
+
+    # C8-C10: PER-SUBPART
+    for i in range(n_parts):
+        lt = parts[i]["lt"]
+        od = t - lt
+        # C8: BOM EXPLOSION
+        if -max_lt <= od < T:
+            model += r[i, od] * parts[i]["partYield"] >= p[t] * parts[i]["qty"], f"bom_{i}_{t}"
+            # C9: RM FLOW BALANCE (with wastage)
+            if t > 0:
+                model += RI[i, t] == RI[i, t-1] + r[i, t] - p[t] * parts[i]["qty"] - wst[t] * parts[i]["qty"] / yield_pct, f"rm_{i}_{t}"
+                # C10: RM WAREHOUSE
+                model += RI[i, t] <= parts[i]["rm_cap"], f"rmcap_{i}_{t}"
+
+# C11-C12: MOQ & SUPPLIER MAX
+for i in range(n_parts):
+    for t in rng_ext:
+        model += r[i, t] >= parts[i]["moq"] * zo[i, t], f"moq_{i}_{t}"
+        model += r[i, t] <= parts[i]["max_order"] * zo[i, t], f"mxo_{i}_{t}"
+
+# ============================================================
+# 6. SOLVE & OUTPUT
+# ============================================================
+# Runs the optimization and prints results.
+print("Solving... (1-2 minutes)")
+model.solve(pulp.PULP_CBC_CMD(msg=1, timeLimit=180))
+print(f"\nStatus: {pulp.LpStatus[model.status]}")
+print(f"Total Cost: ${pulp.value(model.objective):,.0f}\n")
+
+print(f"{'Day':>4} {'Dem':>5} {'Prod':>5} {'Inv':>5} {'Exp':>5} {'Short':>5} {'SW':>3} {'OT':>3} {'RW':>3} {'SUB':>3} {'WST':>3}")
+print("-" * 58)
+tp = te = ts = nsw = tot = trw = tsub = twst = 0
+for t in days:
+    pv = int(p[t].varValue or 0)
+    iv = Inv[t+1].varValue or 0
+    ev = e[t].varValue or 0
+    sv = s[t].varValue or 0
+    swv = 1 if (sw[t].varValue or 0) > 0.5 else 0
+    otv = int(ot[t].varValue or 0)
+    rwv = rw[t].varValue or 0
+    subv = int(sub[t].varValue or 0)
+    wstv = wst[t].varValue or 0
+    tp += pv; te += ev; ts += sv; nsw += swv; tot += otv; trw += rwv; tsub += subv; twst += wstv
+    flag = ""
+    if ev > 0.5: flag = " EXP"
+    if sv > 0.5: flag = " SHORT"
+    if t < 60 or pv > 0 or ev > 0.5 or sv > 0.5 or otv > 0 or rwv > 0.5 or subv > 0 or wstv > 0.5:
+        print(f"{t+1:>4} {demand[t]:>5} {pv:>5} {iv:>5.0f} {ev:>5.0f} {sv:>5.0f} {'Y' if swv else '':>3} {otv:>3} {rwv:>3.0f} {subv:>3} {wstv:>3.0f}{flag}")
+
+fill = (sum(demand) - ts) / sum(demand) * 100
+print(f"\nProduced:{tp} Expired:{te:.0f} Short:{ts:.0f} Switches:{nsw} OT Hours:{tot} Rework:{trw:.0f} Sub:{tsub} Wastage:{twst:.0f} Fill:{fill:.1f}%")
+
+print(f"\nRM ORDERS:")
+for i in range(n_parts):
+    nm = parts[i]["name"]
+    print(f"  {nm}:")
+    tq = npo = 0
+    for t in rng_ext:
+        rv = r[i, t].varValue
+        if rv and rv > 0.5:
+            lt2 = parts[i]["lt"]
+            print(f"    PO day {t+1:>4} qty {int(rv):>5} arrives day {t+lt2+1:>4}")
+            tq += int(rv); npo += 1
+    print(f"    Total: {npo} POs, {tq} units")
+
+import json
+mps = [int(p[t].varValue or 0) for t in days]
+print(f"\n--- JSON for simulator ---")
+print(json.dumps({"source":"MILP","cost":round(pulp.value(model.objective),2),"mps_plan":mps,"fill":round(fill,1)},indent=2))
